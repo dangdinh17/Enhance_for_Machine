@@ -1,4 +1,4 @@
-"""Multi-level ResNet-18 feature loss for images and videos."""
+"""ResNet-18 FPN feature loss for images and videos."""
 
 from __future__ import annotations
 
@@ -7,43 +7,63 @@ from collections.abc import Mapping, Sequence
 import torch
 from torch import Tensor, nn
 from torchvision.models import ResNet18_Weights, resnet18
+from torchvision.models.feature_extraction import create_feature_extractor
+from torchvision.ops import FeaturePyramidNetwork
+from torchvision.ops.feature_pyramid_network import LastLevelMaxPool
 
 
-FEATURE_NAMES = ("relu", "layer1", "layer2", "layer3", "layer4")
+PYRAMID_NAMES = ("p2", "p3", "p4", "p5", "p6")
+BACKBONE_CHANNELS = (64, 128, 256, 512)
 
 
-class ResNet18FeatureExtractor(nn.Module):
-    """Extract intermediate features from an ImageNet ResNet-18.
+class ResNet18FPNFeatureExtractor(nn.Module):
+    """Build hierarchical P2-P6 features with ResNet-18 and Torchvision FPN.
+
+    ResNet stages ``layer1`` through ``layer4`` provide C2-C5 features. The
+    :class:`~torchvision.ops.FeaturePyramidNetwork` adds lateral and top-down
+    paths to produce P2-P5, while ``LastLevelMaxPool`` produces P6. All
+    extractor parameters are frozen because this module is used as a fixed
+    perceptual metric.
 
     Args:
-        feature_names: ResNet stages returned by :meth:`forward`.
+        feature_names: Pyramid levels returned by :meth:`forward`.
         weights: Torchvision weights to load. Pass ``None`` for randomly
             initialized weights, which is mainly useful for offline tests.
+        out_channels: Number of channels in every FPN output level.
         normalize: Apply ImageNet input normalization before extraction.
     """
 
     def __init__(
         self,
-        feature_names: Sequence[str] = FEATURE_NAMES,
+        feature_names: Sequence[str] = PYRAMID_NAMES,
         weights: ResNet18_Weights | None = ResNet18_Weights.DEFAULT,
+        out_channels: int = 256,
         normalize: bool = True,
     ) -> None:
         super().__init__()
-        invalid_names = set(feature_names) - set(FEATURE_NAMES)
+        invalid_names = set(feature_names) - set(PYRAMID_NAMES)
         if invalid_names:
-            raise ValueError(
-                f"Unknown ResNet-18 feature stages: {sorted(invalid_names)}"
-            )
+            raise ValueError(f"Unknown ResNet-18 FPN levels: {sorted(invalid_names)}")
         if not feature_names:
-            raise ValueError("At least one feature stage must be selected")
+            raise ValueError("At least one FPN level must be selected")
+        if out_channels <= 0:
+            raise ValueError("out_channels must be positive")
 
         backbone = resnet18(weights=weights)
-        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
-        self.maxpool = backbone.maxpool
-        self.layer1 = backbone.layer1
-        self.layer2 = backbone.layer2
-        self.layer3 = backbone.layer3
-        self.layer4 = backbone.layer4
+        self.backbone = create_feature_extractor(
+            backbone,
+            return_nodes={
+                "layer1": "p2",
+                "layer2": "p3",
+                "layer3": "p4",
+                "layer4": "p5",
+            },
+        )
+        self.fpn = FeaturePyramidNetwork(
+            in_channels_list=list(BACKBONE_CHANNELS),
+            out_channels=out_channels,
+            extra_blocks=LastLevelMaxPool(),
+        )
         self.feature_names = tuple(feature_names)
         self.normalize = normalize
 
@@ -60,13 +80,13 @@ class ResNet18FeatureExtractor(nn.Module):
         self.requires_grad_(False)
         self.eval()
 
-    def train(self, mode: bool = True) -> ResNet18FeatureExtractor:
-        """Keep the frozen backbone in evaluation mode."""
+    def train(self, mode: bool = True) -> ResNet18FPNFeatureExtractor:
+        """Keep the frozen ResNet-FPN extractor in evaluation mode."""
         del mode
         return super().train(False)
 
     def forward(self, image: Tensor) -> dict[str, Tensor]:
-        """Return selected feature maps for a 4-D RGB image batch."""
+        """Return selected P2-P6 maps for a 4-D RGB image batch."""
         if image.ndim != 4 or image.shape[1] != 3:
             raise ValueError(
                 "Feature extractor input must have shape [N, 3, H, W], "
@@ -79,35 +99,26 @@ class ResNet18FeatureExtractor(nn.Module):
         if self.normalize:
             value = (value - self.image_mean) / self.image_std
 
-        features: dict[str, Tensor] = {}
-        value = self.stem(value)
-        if "relu" in self.feature_names:
-            features["relu"] = value
-        value = self.layer1(self.maxpool(value))
-        if "layer1" in self.feature_names:
-            features["layer1"] = value
-        value = self.layer2(value)
-        if "layer2" in self.feature_names:
-            features["layer2"] = value
-        value = self.layer3(value)
-        if "layer3" in self.feature_names:
-            features["layer3"] = value
-        value = self.layer4(value)
-        if "layer4" in self.feature_names:
-            features["layer4"] = value
-        return features
+        pyramid = self.fpn(self.backbone(value))
+        pyramid["p6"] = pyramid.pop("pool")
+        return {name: pyramid[name] for name in self.feature_names}
+
+
+# Backward-compatible name for callers that imported the previous extractor.
+ResNet18FeatureExtractor = ResNet18FPNFeatureExtractor
 
 
 class FeatureLoss(nn.Module):
-    """Compute weighted perceptual distance at multiple ResNet-18 stages.
+    """Compute weighted perceptual distance over ResNet-18 FPN levels.
 
     Inputs may be images shaped ``[B, C, H, W]`` or videos shaped
     ``[B, T, C, H, W]``. One-channel luma data is repeated to RGB. Pixel
     values are expected in ``input_range`` and are mapped to ``[0, 1]``.
 
     Args:
-        layer_weights: Weight of each selected feature stage.
+        layer_weights: Weight of each selected P2-P6 pyramid level.
         weights: Torchvision ResNet-18 weights.
+        fpn_channels: Number of channels in every FPN output level.
         distance: Feature distance, either ``"l1"`` or ``"mse"``.
         input_range: Minimum and maximum input pixel values.
     """
@@ -116,6 +127,7 @@ class FeatureLoss(nn.Module):
         self,
         layer_weights: Mapping[str, float] | None = None,
         weights: ResNet18_Weights | None = ResNet18_Weights.DEFAULT,
+        fpn_channels: int = 256,
         distance: str = "l1",
         input_range: tuple[float, float] = (0.0, 1.0),
     ) -> None:
@@ -124,11 +136,11 @@ class FeatureLoss(nn.Module):
             layer_weights
             if layer_weights is not None
             else {
-                "relu": 1.0,
-                "layer1": 1.0,
-                "layer2": 1.0,
-                "layer3": 1.0,
-                "layer4": 1.0,
+                "p2": 1.0,
+                "p3": 1.0,
+                "p4": 1.0,
+                "p5": 1.0,
+                "p6": 1.0,
             }
         )
         if any(value < 0.0 for value in selected_weights.values()):
@@ -142,9 +154,10 @@ class FeatureLoss(nn.Module):
             raise ValueError("input_range maximum must be greater than minimum")
 
         self.layer_weights = selected_weights
-        self.extractor = ResNet18FeatureExtractor(
+        self.extractor = ResNet18FPNFeatureExtractor(
             feature_names=tuple(selected_weights),
             weights=weights,
+            out_channels=fpn_channels,
         )
         self.criterion: nn.Module = nn.L1Loss() if distance == "l1" else nn.MSELoss()
         self.input_min = float(input_min)
